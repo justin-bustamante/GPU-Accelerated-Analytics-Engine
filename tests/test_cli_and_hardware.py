@@ -1,9 +1,37 @@
+import argparse
 import json
 
 import pytest
 
-from engine.cli import main
+from engine.cli import main, parse_count
 from engine.telemetry import hardware as hw
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("100000", 100_000),
+        ("100K", 100_000),
+        ("10m", 10**7),
+        ("1.5B", 1_500_000_000),
+        ("250M", 250_000_000),
+    ],
+)
+def test_parse_count(text, expected):
+    assert parse_count(text) == expected
+
+
+@pytest.mark.parametrize("text", ["", "ten", "1.5", "-3", "10X"])
+def test_parse_count_rejects(text):
+    with pytest.raises(argparse.ArgumentTypeError):
+        parse_count(text)
+
+
+def test_cli_generate(tmp_path, capsys):
+    out = tmp_path / "ds"
+    assert main(["generate", "--rows", "5K", "--months", "2", "--output", str(out)]) == 0
+    assert "5,000 rows" in capsys.readouterr().out
+    assert main(["generate", "--rows", "5K", "--output", str(out)]) == 2  # exists, no --overwrite
 
 
 def test_gpu_info_never_raises():

@@ -4,7 +4,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+from pathlib import Path
+
+_SUFFIXES = {"": 1, "K": 10**3, "M": 10**6, "B": 10**9, "G": 10**9}
+
+
+def parse_count(text: str) -> int:
+    """'100000', '100K', '10M', '1.5B' -> int."""
+    m = re.fullmatch(r"\s*([0-9]*\.?[0-9]+)\s*([KMBG]?)\s*", text.upper())
+    if not m:
+        raise argparse.ArgumentTypeError(f"not a row count: {text!r}")
+    value = float(m.group(1)) * _SUFFIXES[m.group(2)]
+    if value != int(value):
+        raise argparse.ArgumentTypeError(f"not a whole number of rows: {text!r}")
+    return int(value)
 
 
 def fmt_bytes(n: float | None) -> str:
@@ -23,6 +38,44 @@ def _section(title: str) -> None:
 
 def _row(label: str, value) -> None:
     print(f"{label:<22}{value}")
+
+
+# ---------------------------------------------------------------------------- generate
+
+
+def cmd_generate(args: argparse.Namespace) -> int:
+    from engine.datagen.generator import GeneratorConfig, generate
+    from engine.telemetry.hardware import is_wsl
+
+    out = Path(args.output).resolve()
+    if is_wsl() and re.match(r"^/mnt/[a-z]/", str(out)):
+        print(
+            f"warning: {out} is on the Windows filesystem. Access from WSL2 goes through a "
+            "9P bridge and is far slower than the Linux filesystem; I/O benchmarks on it "
+            "will mostly measure that bridge.",
+            file=sys.stderr,
+        )
+
+    cfg = GeneratorConfig(
+        rows=args.rows,
+        seed=args.seed,
+        months=args.months,
+        rows_per_file=args.rows_per_file,
+        row_group_size=args.row_group_size,
+        compression=args.compression,
+    )
+    print(
+        f"generating {cfg.rows:,} rows -> {out}  (seed={cfg.seed}, workers={args.workers})",
+        file=sys.stderr,
+    )
+    manifest = generate(cfg, out, workers=args.workers, overwrite=args.overwrite)
+    secs = manifest["generation_seconds"]
+    print(
+        f"done: {manifest['total_rows']:,} rows, {manifest['total_files']} files, "
+        f"{fmt_bytes(manifest['events_bytes'])} on disk in {secs:.1f}s  "
+        f"(fingerprint {manifest['fingerprint']})"
+    )
+    return 0
 
 
 # ------------------------------------------------------------------------- inspect-gpu
@@ -114,6 +167,24 @@ def cmd_inspect_gpu(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m engine", description=__doc__)
     sub = p.add_subparsers(dest="command", required=True)
+
+    g = sub.add_parser("generate", help="generate a synthetic partitioned Parquet dataset")
+    g.add_argument("--rows", type=parse_count, required=True, help="e.g. 100K, 10M, 250M")
+    g.add_argument("--output", required=True, help="dataset root directory")
+    g.add_argument("--seed", type=int, default=42)
+    g.add_argument("--months", type=int, default=24, help="months starting 2025-01 (default 24)")
+    g.add_argument("--rows-per-file", type=parse_count, default=2_000_000)
+    g.add_argument("--row-group-size", type=parse_count, default=1_000_000)
+    g.add_argument(
+        "--compression", default="snappy", choices=["snappy", "zstd", "lz4", "gzip", "none"]
+    )
+    g.add_argument("--workers", type=int, default=1, help="parallel generator processes")
+    g.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="replace an existing dataset (only one this tool generated)",
+    )
+    g.set_defaults(func=cmd_generate)
 
     d = sub.add_parser("inspect-gpu", help="report host, driver, GPU and RAPIDS status")
     d.add_argument("--smoke", action="store_true", help="also run a small cuDF group-by")
