@@ -6,6 +6,7 @@ import argparse
 import json
 import re
 import sys
+import time
 from pathlib import Path
 
 _SUFFIXES = {"": 1, "K": 10**3, "M": 10**6, "B": 10**9, "G": 10**9}
@@ -76,6 +77,90 @@ def cmd_generate(args: argparse.Namespace) -> int:
         f"(fingerprint {manifest['fingerprint']})"
     )
     return 0
+
+
+# ----------------------------------------------------------------------------- inspect
+
+
+def cmd_inspect(args: argparse.Namespace) -> int:
+    from engine.io.metadata import scan_metadata
+
+    t0 = time.perf_counter()
+    stats = scan_metadata(args.dataset)
+    scan_s = time.perf_counter() - t0
+
+    if args.json:
+        print(json.dumps(_inspect_json(stats, scan_s), indent=2, default=str))
+        return 1 if stats.problems else 0
+
+    _section(f"DATASET  {stats.root}")
+    _row("Format", f"Parquet ({', '.join(sorted(stats.compression)) or 'n/a'})")
+    keys = list(dict.fromkeys(k for f in stats.files for k in f.partition))
+    _row("Partitions", f"{len(stats.partitions)}" + (f"  ({', '.join(keys)})" if keys else ""))
+    _row("Files", f"{len(stats.files):,}")
+    _row("Row groups", f"{stats.row_groups:,}")
+    _row("Rows", f"{stats.rows:,}")
+    _row("Size on disk", fmt_bytes(stats.bytes_on_disk))
+    if stats.rows:
+        _row("  per row", f"{stats.bytes_on_disk / stats.rows:.1f} B")
+    if stats.decoded_bytes_per_row is not None:
+        _row(
+            "Decoded size (est.)",
+            f"{fmt_bytes(stats.estimated_decoded_bytes)}  "
+            f"({stats.decoded_bytes_per_row:.1f} B/row, sampled from one row group)",
+        )
+    if stats.timestamp_min is not None:
+        _row("Time range", f"{stats.timestamp_min} .. {stats.timestamp_max}")
+    if stats.manifest:
+        m = stats.manifest
+        _row(
+            "Manifest",
+            f"fingerprint {m['fingerprint']}, seed {m['config']['seed']}, "
+            f"generator v{m['generator_version']}",
+        )
+        if m["total_rows"] != stats.rows:
+            stats.problems.append(
+                (stats.root, f"manifest says {m['total_rows']:,} rows, footers say {stats.rows:,}")
+            )
+    _row("Footer scan", f"{scan_s * 1000:.0f} ms")
+
+    if stats.columns:
+        _section("COLUMNS")
+        total = sum(c.compressed_bytes for c in stats.columns.values()) or 1
+        print(f"{'name':<14}{'type':<16}{'on disk':>12}{'share':>8}{'decoded B/row':>15}")
+        for c in stats.columns.values():
+            dec = f"{c.decoded_bytes_per_row:.1f}" if c.decoded_bytes_per_row is not None else "-"
+            print(
+                f"{c.name:<14}{c.type:<16}{fmt_bytes(c.compressed_bytes):>12}"
+                f"{100 * c.compressed_bytes / total:>7.1f}%{dec:>15}"
+            )
+
+    if stats.problems:
+        _section(f"PROBLEMS ({len(stats.problems)})")
+        for path, msg in stats.problems:
+            print(f"{path}: {msg}")
+        return 1
+    return 0
+
+
+def _inspect_json(stats, scan_s: float) -> dict:
+    return {
+        "root": str(stats.root),
+        "files": len(stats.files),
+        "partitions": len(stats.partitions),
+        "row_groups": stats.row_groups,
+        "rows": stats.rows,
+        "bytes_on_disk": stats.bytes_on_disk,
+        "decoded_bytes_per_row_est": stats.decoded_bytes_per_row,
+        "decoded_bytes_est": stats.estimated_decoded_bytes,
+        "timestamp_min": stats.timestamp_min,
+        "timestamp_max": stats.timestamp_max,
+        "compression": sorted(stats.compression),
+        "columns": [vars(c) for c in stats.columns.values()],
+        "fingerprint": stats.manifest["fingerprint"] if stats.manifest else None,
+        "footer_scan_seconds": scan_s,
+        "problems": [{"path": str(p), "error": e} for p, e in stats.problems],
+    }
 
 
 # ------------------------------------------------------------------------- inspect-gpu
@@ -185,6 +270,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="replace an existing dataset (only one this tool generated)",
     )
     g.set_defaults(func=cmd_generate)
+
+    i = sub.add_parser("inspect", help="summarize a Parquet dataset from its footers")
+    i.add_argument("--dataset", required=True)
+    i.add_argument("--json", action="store_true")
+    i.set_defaults(func=cmd_inspect)
 
     d = sub.add_parser("inspect-gpu", help="report host, driver, GPU and RAPIDS status")
     d.add_argument("--smoke", action="store_true", help="also run a small cuDF group-by")
