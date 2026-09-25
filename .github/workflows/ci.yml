@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    # No GPU on hosted runners: tests marked @pytest.mark.gpu are skipped, and
+    # inspect-gpu is exercised on its "no driver" path.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[dev]"
+      - run: ruff check src tests && ruff format --check src tests
+      - run: pytest
+      - run: python -m engine generate --rows 100K --output data/events-100k
+      - run: python -m engine inspect --dataset data/events-100k
